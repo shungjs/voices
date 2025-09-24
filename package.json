@@ -1,7 +1,7 @@
 {
-  "name": "streamelements-tts-api",
+  "name": "simple-tts-volume-api",
   "version": "1.0.0",
-  "description": "Channel Points TTS with volume progression",
+  "description": "Simple TTS volume progression by usage",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
