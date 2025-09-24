@@ -4,16 +4,21 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// =============================================================================
+// 🎛️ VOLUME SETTINGS - Easy to modify!
+// =============================================================================
+const VOLUME_CONFIG = {
+  startVolume: 0.10,        // Start at 10% volume
+  volumePerMessage: 0.02,   // Each message adds 2% volume  
+  maxVolume: 0.90,          // Maximum 90% volume
+  minVolume: 0.10           // Minimum 10% volume (fallback)
+};
+// =============================================================================
+
 // In-memory storage (resets on server restart/new stream)
 const streamData = {
   users: new Map(),
-  settings: {
-    baseVolume: 0.5,
-    maxVolume: 1.0,
-    minVolume: 0.1,
-    volumeIncrement: 0.05,
-    messagesPerIncrement: 10
-  }
+  settings: VOLUME_CONFIG
 };
 
 // Middleware
@@ -22,9 +27,8 @@ app.use(express.json());
 
 // Helper function to calculate volume based on message count
 function calculateVolume(messageCount) {
-  const { baseVolume, maxVolume, minVolume, volumeIncrement, messagesPerIncrement } = streamData.settings;
-  const increments = Math.floor(messageCount / messagesPerIncrement);
-  const calculatedVolume = baseVolume + (increments * volumeIncrement);
+  const { startVolume, volumePerMessage, maxVolume, minVolume } = streamData.settings;
+  const calculatedVolume = startVolume + (messageCount * volumePerMessage);
   return Math.min(Math.max(calculatedVolume, minVolume), maxVolume);
 }
 
@@ -39,17 +43,19 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Get user volume (main endpoint for TTS)
+// Get user volume (for checking volume)
 app.get('/api/user/:username/volume', (req, res) => {
   const username = req.params.username.toLowerCase();
   const user = streamData.users.get(username) || { messageCount: 0, ttsCount: 0 };
   const volume = calculateVolume(user.messageCount);
+  const messagesUntilMax = Math.max(0, Math.ceil((streamData.settings.maxVolume - volume) / streamData.settings.volumePerMessage));
   
   res.json({
     username,
     volume,
     messageCount: user.messageCount,
-    messagesUntilNext: streamData.settings.messagesPerIncrement - (user.messageCount % streamData.settings.messagesPerIncrement)
+    messagesUntilMax,
+    atMaxVolume: volume >= streamData.settings.maxVolume
   });
 });
 
@@ -63,31 +69,49 @@ app.post('/api/user/:username/message', (req, res) => {
   streamData.users.set(username, user);
   
   const volume = calculateVolume(user.messageCount);
-  const messagesUntilNext = streamData.settings.messagesPerIncrement - (user.messageCount % streamData.settings.messagesPerIncrement);
+  const messagesUntilMax = Math.max(0, Math.ceil((streamData.settings.maxVolume - volume) / streamData.settings.volumePerMessage));
   
   res.json({
     username,
     messageCount: user.messageCount,
     volume,
-    messagesUntilNext,
-    volumeLevelUp: messagesUntilNext === streamData.settings.messagesPerIncrement
+    messagesUntilMax,
+    atMaxVolume: volume >= streamData.settings.maxVolume
   });
 });
 
-// Record TTS usage
-app.post('/api/user/:username/tts', (req, res) => {
+// 🎯 MAIN ENDPOINT: Get TTS volume for channel point redemptions
+app.get('/api/tts/:username', (req, res) => {
   const username = req.params.username.toLowerCase();
-  
   let user = streamData.users.get(username) || { messageCount: 0, ttsCount: 0 };
+  const volume = calculateVolume(user.messageCount);
+  
+  // Record TTS usage
   user.ttsCount += 1;
   streamData.users.set(username, user);
   
+  const volumePercent = Math.round(volume * 100);
+  
+  // Return user-friendly message for StreamElements
+  res.send(`🔊 @${username} TTS Volume: ${volumePercent}% (${user.messageCount} messages) - Use volume: ${volume.toFixed(2)}`);
+});
+
+// Alternative JSON endpoint for advanced integrations
+app.get('/api/tts/:username/json', (req, res) => {
+  const username = req.params.username.toLowerCase();
+  let user = streamData.users.get(username) || { messageCount: 0, ttsCount: 0 };
   const volume = calculateVolume(user.messageCount);
+  
+  user.ttsCount += 1;
+  streamData.users.set(username, user);
   
   res.json({
     username,
     volume,
-    ttsCount: user.ttsCount
+    volumePercent: Math.round(volume * 100),
+    messageCount: user.messageCount,
+    ttsCount: user.ttsCount,
+    success: true
   });
 });
 
@@ -103,7 +127,11 @@ app.get('/api/leaderboard', (req, res) => {
     .sort((a, b) => b.messageCount - a.messageCount)
     .slice(0, 10);
   
-  res.json({ users });
+  const leaderboard = users.map((user, i) => 
+    `${i + 1}. ${user.username} (${user.messageCount} msgs, ${Math.round(user.volume * 100)}% vol)`
+  ).join(' | ');
+  
+  res.send(`🏆 Top Chatters: ${leaderboard || 'No data yet!'}`);
 });
 
 // Get/Update settings
@@ -112,13 +140,12 @@ app.get('/api/settings', (req, res) => {
 });
 
 app.put('/api/settings', (req, res) => {
-  const { baseVolume, maxVolume, minVolume, volumeIncrement, messagesPerIncrement } = req.body;
+  const { startVolume, volumePerMessage, maxVolume, minVolume } = req.body;
   
-  if (baseVolume !== undefined) streamData.settings.baseVolume = Math.max(0, Math.min(1, baseVolume));
+  if (startVolume !== undefined) streamData.settings.startVolume = Math.max(0, Math.min(1, startVolume));
   if (maxVolume !== undefined) streamData.settings.maxVolume = Math.max(0, Math.min(1, maxVolume));
   if (minVolume !== undefined) streamData.settings.minVolume = Math.max(0, Math.min(1, minVolume));
-  if (volumeIncrement !== undefined) streamData.settings.volumeIncrement = Math.max(0, volumeIncrement);
-  if (messagesPerIncrement !== undefined) streamData.settings.messagesPerIncrement = Math.max(1, messagesPerIncrement);
+  if (volumePerMessage !== undefined) streamData.settings.volumePerMessage = Math.max(0, volumePerMessage);
   
   res.json({ message: 'Settings updated', settings: streamData.settings });
 });
@@ -126,7 +153,7 @@ app.put('/api/settings', (req, res) => {
 // Reset stream data (for new stream)
 app.post('/api/reset', (req, res) => {
   streamData.users.clear();
-  res.json({ message: 'Stream data reset', totalUsers: 0 });
+  res.send('🔄 Stream data reset! Ready for new stream.');
 });
 
 // Get stream stats
@@ -135,19 +162,14 @@ app.get('/api/stats', (req, res) => {
   const totalMessages = users.reduce((sum, user) => sum + user.messageCount, 0);
   const totalTTS = users.reduce((sum, user) => sum + user.ttsCount, 0);
   
-  res.json({
-    totalUsers: streamData.users.size,
-    totalMessages,
-    totalTTS,
-    uptime: Math.floor(process.uptime())
-  });
+  res.send(`📊 Stream Stats: ${streamData.users.size} users | ${totalMessages} messages | ${totalTTS} TTS used | ${Math.floor(process.uptime() / 60)}m uptime`);
 });
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 StreamElements Session API running on port ${PORT}`);
+  console.log(`🚀 StreamElements TTS API running on port ${PORT}`);
   console.log(`📊 Health: http://localhost:${PORT}/health`);
-  console.log(`🎯 Ready for StreamElements integration!`);
+  console.log(`🎯 Ready for Channel Points integration!`);
 });
 
 module.exports = app;
