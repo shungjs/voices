@@ -9,9 +9,8 @@ const PORT = process.env.PORT || 3000;
 // =============================================================================
 const VOLUME_CONFIG = {
   startVolume: 0.10,        // Start at 10% volume
-  volumePerMessage: 0.02,   // Each message adds 2% volume  
+  volumePerTTS: 0.02,       // Each TTS use adds 2% volume  
   maxVolume: 0.90,          // Maximum 90% volume
-  minVolume: 0.10           // Minimum 10% volume (fallback)
 };
 // =============================================================================
 
@@ -25,11 +24,11 @@ const streamData = {
 app.use(cors());
 app.use(express.json());
 
-// Helper function to calculate volume based on message count
-function calculateVolume(messageCount) {
-  const { startVolume, volumePerMessage, maxVolume, minVolume } = streamData.settings;
-  const calculatedVolume = startVolume + (messageCount * volumePerMessage);
-  return Math.min(Math.max(calculatedVolume, minVolume), maxVolume);
+// Helper function to calculate volume based on TTS usage
+function calculateVolume(ttsCount) {
+  const { startVolume, volumePerTTS, maxVolume } = streamData.settings;
+  const calculatedVolume = startVolume + (ttsCount * volumePerTTS);
+  return Math.min(calculatedVolume, maxVolume);
 }
 
 // Routes
@@ -43,7 +42,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Get user volume (for checking volume)
+// Get user volume (main endpoint for TTS)
 app.get('/api/user/:username/volume', (req, res) => {
   const username = req.params.username.toLowerCase();
   const user = streamData.users.get(username) || { messageCount: 0, ttsCount: 0 };
@@ -80,28 +79,37 @@ app.post('/api/user/:username/message', (req, res) => {
   });
 });
 
-// 🎯 MAIN ENDPOINT: Get TTS volume for channel point redemptions
-app.get('/api/tts/:username', (req, res) => {
+// Record TTS usage and return volume
+app.post('/api/user/:username/tts', (req, res) => {
   const username = req.params.username.toLowerCase();
-  let user = streamData.users.get(username) || { messageCount: 0, ttsCount: 0 };
-  const volume = calculateVolume(user.messageCount);
+  const { message } = req.body;
   
-  // Record TTS usage
+  let user = streamData.users.get(username) || { messageCount: 0, ttsCount: 0 };
   user.ttsCount += 1;
+  user.lastTTSMessage = message || '';
+  user.lastTTSTime = new Date().toISOString();
   streamData.users.set(username, user);
   
-  const volumePercent = Math.round(volume * 100);
-  
-  // Return user-friendly message for StreamElements
-  res.send(`🔊 @${username} TTS Volume: ${volumePercent}% (${user.messageCount} messages) - Use volume: ${volume.toFixed(2)}`);
-});
-
-// Alternative JSON endpoint for advanced integrations
-app.get('/api/tts/:username/json', (req, res) => {
-  const username = req.params.username.toLowerCase();
-  let user = streamData.users.get(username) || { messageCount: 0, ttsCount: 0 };
   const volume = calculateVolume(user.messageCount);
   
+  res.json({
+    username,
+    volume,
+    volumePercent: Math.round(volume * 100),
+    ttsCount: user.ttsCount,
+    messageCount: user.messageCount,
+    message: message || '',
+    success: true
+  });
+});
+
+// Get TTS volume only (for channel point redemptions)
+app.get('/api/tts/:username', (req, res) => {
+  const username = req.params.username.toLowerCase();
+  const user = streamData.users.get(username) || { messageCount: 0, ttsCount: 0 };
+  const volume = calculateVolume(user.messageCount);
+  
+  // Also record this as a TTS usage
   user.ttsCount += 1;
   streamData.users.set(username, user);
   
@@ -110,8 +118,7 @@ app.get('/api/tts/:username/json', (req, res) => {
     volume,
     volumePercent: Math.round(volume * 100),
     messageCount: user.messageCount,
-    ttsCount: user.ttsCount,
-    success: true
+    ttsCount: user.ttsCount
   });
 });
 
@@ -127,11 +134,7 @@ app.get('/api/leaderboard', (req, res) => {
     .sort((a, b) => b.messageCount - a.messageCount)
     .slice(0, 10);
   
-  const leaderboard = users.map((user, i) => 
-    `${i + 1}. ${user.username} (${user.messageCount} msgs, ${Math.round(user.volume * 100)}% vol)`
-  ).join(' | ');
-  
-  res.send(`🏆 Top Chatters: ${leaderboard || 'No data yet!'}`);
+  res.json({ users });
 });
 
 // Get/Update settings
@@ -140,12 +143,11 @@ app.get('/api/settings', (req, res) => {
 });
 
 app.put('/api/settings', (req, res) => {
-  const { startVolume, volumePerMessage, maxVolume, minVolume } = req.body;
+  const { startVolume, volumePerTTS, maxVolume } = req.body;
   
   if (startVolume !== undefined) streamData.settings.startVolume = Math.max(0, Math.min(1, startVolume));
   if (maxVolume !== undefined) streamData.settings.maxVolume = Math.max(0, Math.min(1, maxVolume));
-  if (minVolume !== undefined) streamData.settings.minVolume = Math.max(0, Math.min(1, minVolume));
-  if (volumePerMessage !== undefined) streamData.settings.volumePerMessage = Math.max(0, volumePerMessage);
+  if (volumePerTTS !== undefined) streamData.settings.volumePerTTS = Math.max(0, volumePerTTS);
   
   res.json({ message: 'Settings updated', settings: streamData.settings });
 });
@@ -153,7 +155,7 @@ app.put('/api/settings', (req, res) => {
 // Reset stream data (for new stream)
 app.post('/api/reset', (req, res) => {
   streamData.users.clear();
-  res.send('🔄 Stream data reset! Ready for new stream.');
+  res.json({ message: 'Stream data reset', totalUsers: 0 });
 });
 
 // Get stream stats
@@ -162,14 +164,19 @@ app.get('/api/stats', (req, res) => {
   const totalMessages = users.reduce((sum, user) => sum + user.messageCount, 0);
   const totalTTS = users.reduce((sum, user) => sum + user.ttsCount, 0);
   
-  res.send(`📊 Stream Stats: ${streamData.users.size} users | ${totalMessages} messages | ${totalTTS} TTS used | ${Math.floor(process.uptime() / 60)}m uptime`);
+  res.json({
+    totalUsers: streamData.users.size,
+    totalMessages,
+    totalTTS,
+    uptime: Math.floor(process.uptime())
+  });
 });
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 StreamElements TTS API running on port ${PORT}`);
+  console.log(`🚀 StreamElements Session API running on port ${PORT}`);
   console.log(`📊 Health: http://localhost:${PORT}/health`);
-  console.log(`🎯 Ready for Channel Points integration!`);
+  console.log(`🎯 Ready for StreamElements integration!`);
 });
 
 module.exports = app;
